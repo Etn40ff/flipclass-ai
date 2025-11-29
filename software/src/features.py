@@ -1,63 +1,122 @@
 #!/usr/bin/env python3
 """
-Feature extraction for canonical dataset.
+Feature extraction from polynomials.
 
-Outputs a pickle with {'X': pandas.DataFrame, 'y': np.ndarray, 'meta': [...]} 
+Input: pickle created by build_dataset.py (list of {'polynomial':str, 'target':int, ...})
+Output: pickle {"X": pandas.DataFrame, "y": np.ndarray, "meta": [...]} 
+
+Features derived from polynomial (string) using sympy when available, else a simple parser:
+- total_degree, degree_x, degree_y, n_terms
+- coeff_min/coeff_max/coeff_mean/coeff_std
+- coeff_l1 / coeff_l2
+- counts of monomials by total degree up to max_deg_cap (caps at 6)
 """
 import argparse
 import pickle
 from typing import Dict
-import networkx as nx
-import numpy as np
 import pandas as pd
+import numpy as np
 
-def count_st_paths_dag(G: nx.DiGraph) -> int:
-    if not nx.is_directed_acyclic_graph(G):
-        return -1
-    topo = list(nx.topological_sort(G))
-    dp = {v: 0 for v in topo}
-    sources = [v for v in G.nodes() if G.in_degree(v) == 0]
-    sinks = [v for v in G.nodes() if G.out_degree(v) == 0]
-    for s in sources:
-        dp[s] = dp.get(s, 0) + 1
-    for v in topo:
-        for w in G.successors(v):
-            dp[w] = dp.get(w, 0) + dp[v]
-    return int(sum(dp[t] for t in sinks))
+def poly_to_features(poly_str: str, max_deg_cap: int = 6) -> Dict[str, float]:
+    s = poly_str.replace("^", "**")
+    coeffs = []
+    degrees = []
+    deg_x = 0
+    deg_y = 0
+    n_terms = 0
+    try:
+        import sympy as sp
+        x, y = sp.symbols("x y")
+        expr = sp.sympify(s)
+        P = sp.Poly(expr, x, y)
+        terms = P.terms()  # list of ((i,j), coeff)
+        for (i, j), c in terms:
+            try:
+                cf = float(sp.N(c))
+            except Exception:
+                cf = float(c)
+            coeffs.append(cf)
+            degrees.append(i + j)
+            deg_x = max(deg_x, i)
+            deg_y = max(deg_y, j)
+            n_terms += 1
+    except Exception:
+        # fallback: crude parser: find monomials like coef*x^i*y^j or x^i*y^j or numeric constants
+        import re
+        # replace '-' with '+-' to split terms
+        t = s.replace("-", "+-")
+        parts = [p.strip() for p in t.split("+") if p.strip() != ""]
+        for p in parts:
+            # attempt to extract coefficient
+            coef = 1.0
+            px = p
+            m = re.match(r"^([+-]?[0-9]*(?:\.[0-9]+)?)\s*\*?\s*(.*)$", p)
+            if m:
+                coef_s, rest = m.groups()
+                if coef_s not in ("", "+", "-"):
+                    try:
+                        coef = float(coef_s)
+                        px = rest
+                    except Exception:
+                        coef = 1.0
+                        px = p
+                else:
+                    if coef_s == "-":
+                        coef = -1.0
+                    px = rest
+            # find exponents
+            ix = 0
+            iy = 0
+            mx = re.search(r"x(?:\s*\*\*|\^)\s*(\d+)", px)
+            my = re.search(r"y(?:\s*\*\*|\^)\s*(\d+)", px)
+            if mx:
+                ix = int(mx.group(1))
+            elif "x" in px:
+                ix = 1
+            if my:
+                iy = int(my.group(1))
+            elif "y" in px:
+                iy = 1
+            coeffs.append(coef)
+            degrees.append(ix + iy)
+            deg_x = max(deg_x, ix)
+            deg_y = max(deg_y, iy)
+            n_terms += 1
 
-def topological_level_counts(G: nx.DiGraph, max_levels: int = 6):
-    if not nx.is_directed_acyclic_graph(G):
-        return [0] * max_levels
-    level = {}
-    for v in nx.topological_sort(G):
-        if G.in_degree(v) == 0:
-            level[v] = 0
-        else:
-            level[v] = 1 + max(level[p] for p in G.predecessors(v))
-    maxl = max(level.values()) if level else 0
-    counts = [0] * max_levels
-    for v, l in level.items():
-        if l < max_levels:
-            counts[l] += 1
-    return counts
+    # compute numeric summaries
+    if coeffs:
+        arr = np.array(coeffs, dtype=float)
+        coeff_min = float(np.min(arr))
+        coeff_max = float(np.max(arr))
+        coeff_mean = float(np.mean(arr))
+        coeff_std = float(np.std(arr))
+        coeff_l1 = float(np.sum(np.abs(arr)))
+        coeff_l2 = float(np.sqrt(np.sum(arr * arr)))
+        n_nonzero = int(np.sum(arr != 0))
+    else:
+        coeff_min = coeff_max = coeff_mean = coeff_std = coeff_l1 = coeff_l2 = 0.0
+        n_nonzero = 0
 
-def features_from_graph(G: nx.DiGraph) -> Dict[str, float]:
-    feats = {}
-    feats["n_nodes"] = float(G.number_of_nodes())
-    feats["n_edges"] = float(G.number_of_edges())
-    indeg = [d for _, d in G.in_degree()]
-    outdeg = [d for _, d in G.out_degree()]
-    for name, seq in ("indeg", indeg), ("outdeg", outdeg):
-        feats[f"{name}_min"] = float(min(seq)) if seq else 0.0
-        feats[f"{name}_max"] = float(max(seq)) if seq else 0.0
-        feats[f"{name}_mean"] = float(np.mean(seq)) if seq else 0.0
-        feats[f"{name}_std"] = float(np.std(seq)) if seq else 0.0
-    feats["n_sources"] = float(sum(1 for v in G.nodes() if G.in_degree(v) == 0))
-    feats["n_sinks"] = float(sum(1 for v in G.nodes() if G.out_degree(v) == 0))
-    levels = topological_level_counts(G, max_levels=6)
-    for i, c in enumerate(levels):
-        feats[f"level_count_{i}"] = float(c)
-    feats["unlabelled_st_paths"] = float(count_st_paths_dag(G))
+    # monomial degree counts up to cap
+    degree_counts = {f"deg_count_{d}": 0.0 for d in range(max_deg_cap + 1)}
+    for d in degrees:
+        if d <= max_deg_cap:
+            degree_counts[f"deg_count_{d}"] += 1.0
+
+    feats = {
+        "total_degree": float(max(degrees) if degrees else 0),
+        "degree_x": float(deg_x),
+        "degree_y": float(deg_y),
+        "n_terms": float(n_terms),
+        "coeff_min": coeff_min,
+        "coeff_max": coeff_max,
+        "coeff_mean": coeff_mean,
+        "coeff_std": coeff_std,
+        "coeff_l1": coeff_l1,
+        "coeff_l2": coeff_l2,
+        "n_nonzero_coeffs": float(n_nonzero),
+    }
+    feats.update(degree_counts)
     return feats
 
 def main():
@@ -65,3 +124,24 @@ def main():
     p.add_argument("--in", dest="infile", required=True)
     p.add_argument("--out", dest="outfile", required=True)
     args = p.parse_args()
+
+    with open(args.infile, "rb") as f:
+        examples = pickle.load(f)
+
+    rows = []
+    y = []
+    meta = []
+    for item in examples:
+        poly_str = item.get("polynomial") or str(item)
+        feats = poly_to_features(poly_str, max_deg_cap=6)
+        rows.append(feats)
+        y.append(int(item.get("target", 0)))
+        meta.append({"source_file": item.get("source_file")})
+    X = pd.DataFrame(rows)
+    y_arr = np.array(y, dtype=int)
+    with open(args.out, "wb") as f:
+        pickle.dump({"X": X, "y": y_arr, "meta": meta}, f)
+    print("Wrote features:", X.shape)
+
+if __name__ == "__main__":
+    main()

@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
 """
 Inspector for data/db files saved with Sage's save().
-This loader uses Sage's load() exclusively and therefore must be run
-with Sage's Python (e.g. `sage -python ...`) or in an environment where
-`from sage.all import load` succeeds.
+Now expects values to be (graph, polynomial) tuples and inspects polynomial info.
+Run with Sage's python: sage -python software/src/check_data.py --db-dir data/db
 """
 import os
 import argparse
 from typing import Any
 from sage.all import load  # requires Sage
+import re
 
 def load_file(path: str) -> Any:
-    # Use Sage's load() only.
     return load(path)
+
+def poly_summary(poly) -> str:
+    try:
+        s = str(poly)
+        # short, sanitized
+        s2 = re.sub(r"\s+", " ", s)
+        if len(s2) > 200:
+            s2 = s2[:200] + "..."
+        return s2
+    except Exception:
+        return repr(poly)[:200]
 
 def inspect(path: str, sample: int = 3) -> None:
     print("===", path)
@@ -35,8 +45,14 @@ def inspect(path: str, sample: int = 3) -> None:
         except Exception:
             print("N/A")
         print("   value type:", type(v))
-        print("   key repr:", repr(k)[:200].replace("\n", " "))
-        print("   value repr:", repr(v)[:200].replace("\n", " "))
+        try:
+            if isinstance(v, (list, tuple)) and len(v) >= 2:
+                poly = v[1]
+                print("   poly repr:", poly_summary(poly))
+            else:
+                print("   value repr:", repr(v)[:200].replace('\n', ' '))
+        except Exception as e:
+            print("   poly inspect error:", e)
 
 def main():
     p = argparse.ArgumentParser()
