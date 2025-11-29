@@ -1,67 +1,73 @@
 #!/usr/bin/env python3
 """
-Feature extraction for canonical dataset.
+Optional: vectorize polys.pkl into dense arrays up to max-degree (backward compatible).
+If you prefer the sparse infinite-index model, you can skip this step and use the
+online sparse trainer directly on polys.pkl.
 
-Outputs a pickle with {'X': pandas.DataFrame, 'y': np.ndarray, 'meta': [...]} 
+Produces: dataset/features.pkl with keys:
+  {"X": ndarray, "y": ndarray, "meta": [...], "monomials": [(i,j)...], "max_degree": D}
 """
 import argparse
 import pickle
-from typing import Dict
-import networkx as nx
 import numpy as np
-import pandas as pd
+from typing import List, Tuple, Dict
 
-def count_st_paths_dag(G: nx.DiGraph) -> int:
-    if not nx.is_directed_acyclic_graph(G):
-        return -1
-    topo = list(nx.topological_sort(G))
-    dp = {v: 0 for v in topo}
-    sources = [v for v in G.nodes() if G.in_degree(v) == 0]
-    sinks = [v for v in G.nodes() if G.out_degree(v) == 0]
-    for s in sources:
-        dp[s] = dp.get(s, 0) + 1
-    for v in topo:
-        for w in G.successors(v):
-            dp[w] = dp.get(w, 0) + dp[v]
-    return int(sum(dp[t] for t in sinks))
+def parse_coef_keys(coef_map: Dict[str, float]):
+    exps = []
+    for k in coef_map.keys():
+        try:
+            i_s, j_s = k.split("_")
+            exps.append((int(i_s), int(j_s)))
+        except Exception:
+            continue
+    return exps
 
-def topological_level_counts(G: nx.DiGraph, max_levels: int = 6):
-    if not nx.is_directed_acyclic_graph(G):
-        return [0] * max_levels
-    level = {}
-    for v in nx.topological_sort(G):
-        if G.in_degree(v) == 0:
-            level[v] = 0
-        else:
-            level[v] = 1 + max(level[p] for p in G.predecessors(v))
-    maxl = max(level.values()) if level else 0
-    counts = [0] * max_levels
-    for v, l in level.items():
-        if l < max_levels:
-            counts[l] += 1
-    return counts
+def build_monomials(max_degree: int) -> List[Tuple[int,int]]:
+    out = []
+    for d in range(0, max_degree+1):
+        for i in range(d, -1, -1):
+            j = d - i
+            out.append((i,j))
+    return out
 
-def features_from_graph(G: nx.DiGraph) -> Dict[str, float]:
-    feats = {}
-    feats["n_nodes"] = float(G.number_of_nodes())
-    feats["n_edges"] = float(G.number_of_edges())
-    indeg = [d for _, d in G.in_degree()]
-    outdeg = [d for _, d in G.out_degree()]
-    for name, seq in ("indeg", indeg), ("outdeg", outdeg):
-        feats[f"{name}_min"] = float(min(seq)) if seq else 0.0
-        feats[f"{name}_max"] = float(max(seq)) if seq else 0.0
-        feats[f"{name}_mean"] = float(np.mean(seq)) if seq else 0.0
-        feats[f"{name}_std"] = float(np.std(seq)) if seq else 0.0
-    feats["n_sources"] = float(sum(1 for v in G.nodes() if G.in_degree(v) == 0))
-    feats["n_sinks"] = float(sum(1 for v in G.nodes() if G.out_degree(v) == 0))
-    levels = topological_level_counts(G, max_levels=6)
-    for i, c in enumerate(levels):
-        feats[f"level_count_{i}"] = float(c)
-    feats["unlabelled_st_paths"] = float(count_st_paths_dag(G))
-    return feats
+def coefs_to_vector(coefs: Dict[str, float], monomials: List[Tuple[int,int]]):
+    v = np.zeros(len(monomials), dtype=float)
+    for idx, (i,j) in enumerate(monomials):
+        v[idx] = float(coefs.get(f"{i}_{j}", 0.0))
+    return v
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--in", dest="infile", required=True)
     p.add_argument("--out", dest="outfile", required=True)
+    p.add_argument("--max-degree", dest="max_degree", type=int, default=None)
     args = p.parse_args()
+
+    with open(args.infile, "rb") as f:
+        examples = pickle.load(f)
+    if not isinstance(examples, list):
+        raise SystemExit("expected list")
+
+    # detect max degree if not provided
+    observed = 0
+    for ex in examples:
+        coefs = ex.get("poly_coefs", {}) or {}
+        for (i,j) in parse_coef_keys(coefs):
+            observed = max(observed, i + j)
+    max_deg = args.max_degree if args.max_degree is not None else observed
+    monomials = build_monomials(max_deg)
+
+    X = np.zeros((len(examples), len(monomials)), dtype=float)
+    y = np.zeros((len(examples),), dtype=int)
+    meta = []
+    for k, ex in enumerate(examples):
+        X[k, :] = coefs_to_vector(ex.get("poly_coefs", {}) or {}, monomials)
+        y[k] = int(ex.get("target", 0))
+        meta.append({"source_file": ex.get("source_file")})
+    out = {"X": X, "y": y, "meta": meta, "monomials": monomials, "max_degree": max_deg}
+    with open(args.outfile, "wb") as f:
+        pickle.dump(out, f)
+    print("Wrote features:", X.shape, "max_degree:", max_deg)
+
+if __name__ == "__main__":
+    main()

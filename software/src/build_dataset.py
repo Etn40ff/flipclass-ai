@@ -1,151 +1,166 @@
 #!/usr/bin/env python3
 """
-Build a canonical dataset from files created with Sage's save().
+Load DB files and convert stored polynomials to structured coefficient maps.
 
-This loader uses Sage's load() exclusively (no decoding heuristics).
-Run with Sage's Python (sage -python ...) or ensure sage.all is importable.
+Each output example is a dict:
+  {
+    "poly_coefs": {"i_j": coeff, ...},
+    "target": int,
+    "source_file": str
+  }
 
-Output: pickle file containing a list of dicts:
-  {'canonical_id': int, 'graph': networkx.DiGraph, 'members': [...], 'count': int}
+This script prefers to parse polynomials via sympy when given as strings, but
+also accepts objects produced by Sage if you run with sage -python (load()).
 """
 import os
 import argparse
 import pickle
-from typing import Any, List, Tuple
-import networkx as nx
-from sage.all import load  # requires Sage
-from software.src.canonicalize import group_isomorphism_classes
+from typing import Any, Dict, List
 
-def load_file(path: str) -> Any:
-    # Strict: use Sage's load only
-    return load(path)
-
-def to_networkx_graph(obj: Any) -> nx.DiGraph:
+def poly_to_coefs(poly) -> Dict[str, float]:
     """
-    Convert the loaded graph object to a networkx.DiGraph.
-    Accepts:
-      - networkx.DiGraph (returns a copy)
-      - Python dict in two forms:
-          {'nodes': [...], 'edges': [(u,v), ...]}
-          adjacency dict {u: [v1, v2, ...], ...}
-      - Common Sage graph-like objects: try .to_networkx(), .to_networkx_graph(),
-        or use vertices()/edges() methods.
-    Raises RuntimeError on unsupported types.
+    Convert a polynomial (string or sympy/sage object) to a dict "i_j" -> float.
+    Uses sympy when available; otherwise falls back to a best-effort text parser.
     """
-    if isinstance(obj, nx.DiGraph):
-        return obj.copy()
-    # Python dict encodings
-    if isinstance(obj, dict):
-        if "nodes" in obj and "edges" in obj:
-            G = nx.DiGraph()
-            G.add_nodes_from(obj["nodes"])
-            G.add_edges_from(obj["edges"])
-            return G
-        if all(isinstance(v, (list, tuple)) for v in obj.values()):
-            G = nx.DiGraph()
-            for u, vs in obj.items():
-                G.add_node(u)
-                for v in vs:
-                    G.add_edge(u, v)
-            return G
-    # Sage graph objects: try common conversion methods
-    if hasattr(obj, "to_networkx"):
-        try:
-            nxg = obj.to_networkx()
-            if not isinstance(nxg, nx.DiGraph):
-                nxg = nx.DiGraph(nxg)
-            return nxg
-        except Exception:
-            pass
-    if hasattr(obj, "to_networkx_graph"):
-        try:
-            nxg = obj.to_networkx_graph()
-            if not isinstance(nxg, nx.DiGraph):
-                nxg = nx.DiGraph(nxg)
-            return nxg
-        except Exception:
-            pass
-    if hasattr(obj, "vertices") and hasattr(obj, "edges"):
-        try:
-            nodes = list(obj.vertices())
-            raw_edges = list(obj.edges())
-            edges = []
-            for e in raw_edges:
+    # If it's already a mapping, pass through
+    if isinstance(poly, dict):
+        # assume keys already "i_j" -> coeff
+        out = {}
+        for k, v in poly.items():
+            try:
+                out[str(k)] = float(v)
+            except Exception:
                 try:
-                    if len(e) >= 2:
-                        edges.append((e[0], e[1]))
-                    else:
-                        pass
+                    out[str(k)] = float(str(v))
                 except Exception:
-                    try:
-                        tup = tuple(e)
-                        if len(tup) >= 2:
-                            edges.append((tup[0], tup[1]))
-                    except Exception:
-                        pass
-            G = nx.DiGraph()
-            G.add_nodes_from(nodes)
-            G.add_edges_from(edges)
-            return G
-        except Exception:
-            pass
-    raise RuntimeError(f"Unsupported graph object of type {type(obj)}; cannot convert to networkx.DiGraph")
+                    out[str(k)] = 0.0
+        return out
 
-def extract_examples_from_file(path: str) -> List[Tuple[nx.DiGraph, int]]:
-    data = load_file(path)
-    if not isinstance(data, dict):
-        raise RuntimeError(f"file {path} does not contain a top-level dict (got {type(data)})")
-    examples: List[Tuple[nx.DiGraph, int]] = []
-    for k, v in data.items():
+    s = str(poly)
+    try:
+        import sympy as sp
+        x, y = sp.symbols("x y")
+        expr = sp.sympify(s)
+        P = sp.Poly(expr, x, y)
+        terms = P.terms()
+        coefs = {}
+        for (i, j), c in terms:
+            try:
+                cf = float(sp.N(c))
+            except Exception:
+                cf = float(c)
+            coefs[f"{i}_{j}"] = cf
+        return coefs
+    except Exception:
+        # Fallback simple parser: split terms, detect x^i y^j
+        import re
+        t = s.replace("-", "+-")
+        parts = [p.strip() for p in t.split("+") if p.strip() != ""]
+        coefs = {}
+        for p in parts:
+            coef = 1.0
+            px = p
+            m = re.match(r"^([+-]?[0-9]*(?:\.[0-9]+)?)\s*\*?\s*(.*)$", p)
+            if m:
+                coef_s, rest = m.groups()
+                if coef_s not in ("", "+", "-"):
+                    try:
+                        coef = float(coef_s)
+                        px = rest
+                    except Exception:
+                        coef = 1.0
+                        px = p
+                else:
+                    if coef_s == "-":
+                        coef = -1.0
+                    px = rest
+            ix = 0
+            iy = 0
+            mx = re.search(r"x(?:\s*\*\*|\^)\s*(\d+)", px)
+            my = re.search(r"y(?:\s*\*\*|\^)\s*(\d+)", px)
+            if mx:
+                ix = int(mx.group(1))
+            elif "x" in px:
+                ix = 1
+            if my:
+                iy = int(my.group(1))
+            elif "y" in px:
+                iy = 1
+            key = f"{ix}_{iy}"
+            coefs[key] = coefs.get(key, 0.0) + float(coef)
+        return coefs
+
+def extract_examples_from_file(path: str) -> List[Dict]:
+    """
+    Load a DB file and return a list of examples with structured poly maps.
+    The loader used depends on file contents:
+      - If the file is a pickle of a dict, we try to read it.
+      - Otherwise, if Sage load is available and the file contains Sage objects,
+        you can call this under sage -python and import load here.
+    """
+    # Try pickle first
+    try:
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+    except Exception:
+        # try sage load if running under sage environment
         try:
-            target = len(k)
+            from sage.all import load  # type: ignore
+            data = load(path)
+        except Exception as e:
+            raise RuntimeError(f"Could not load {path}: {e}")
+
+    if not isinstance(data, dict):
+        # If a list/dict of examples already, try to normalize
+        # Accept list of tuples (key, (graph, poly)) or similar
+        examples = []
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and "poly_coefs" in item:
+                    examples.append(item)
+            return examples
+        raise RuntimeError(f"file {path} does not contain expected top-level dict/list (got {type(data)})")
+
+    out = []
+    for key, val in data.items():
+        # target heuristic: if key is a sequence, use its length; otherwise 0
+        try:
+            target = int(len(key))
         except Exception:
-            raise RuntimeError(f"Could not compute len(key) for key: {repr(k)[:200]}")
-        G = to_networkx_graph(v)
-        # drop attributes to focus on unlabelled structure
-        H = nx.DiGraph()
-        H.add_nodes_from(G.nodes())
-        H.add_edges_from(G.edges())
-        examples.append((H, int(target)))
-    return examples
+            target = 0
+        # expect val to be (graph, poly) or similar
+        poly = None
+        if isinstance(val, (list, tuple)) and len(val) >= 2:
+            poly = val[1]
+        else:
+            poly = val
+        coefs = poly_to_coefs(poly)
+        out.append({"poly_coefs": coefs, "target": int(target)})
+    # annotate source_file at caller level
+    return out
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--db-dir", default="data/db")
-    p.add_argument("--out", required=True)
+    p.add_argument("--db-dir", required=True, help="directory with DB files")
+    p.add_argument("--out", required=True, help="output pickle path for consolidated examples")
     args = p.parse_args()
 
-    if not os.path.isdir(args.db_dir):
-        raise SystemExit("db-dir not found: " + args.db_dir)
     files = sorted(os.listdir(args.db_dir))
-    all_graphs = []
-    all_targets = []
+    all_examples = []
     for fn in files:
-        fp = os.path.join(args.db_dir, fn)
-        print("loading", fp)
-        exs = extract_examples_from_file(fp)
-        for G, t in exs:
-            all_graphs.append(G)
-            all_targets.append(int(t))
+        path = os.path.join(args.db_dir, fn)
+        try:
+            exs = extract_examples_from_file(path)
+        except Exception as e:
+            print("skipping", fn, "load error:", e)
+            continue
+        for ex in exs:
+            ex["source_file"] = fn
+        all_examples.extend(exs)
 
-    mapping, reps = group_isomorphism_classes(all_graphs)
-
-    canonical_list = []
-    for cid, members in mapping.items():
-        counts = [all_targets[i] for i in members]
-        uniq = sorted(set(counts))
-        if len(uniq) > 1:
-            print(f"WARNING: isomorphism class {cid} has multiple counts {uniq}; storing first")
-        rep_graph = all_graphs[members[0]]
-        canonical_list.append({
-            "canonical_id": int(cid),
-            "graph": rep_graph,
-            "members": members,
-            "count": int(uniq[0])
-        })
     with open(args.out, "wb") as f:
-        pickle.dump(canonical_list, f)
-    print("wrote", len(canonical_list), "canonical examples to", args.out)
+        pickle.dump(all_examples, f)
+    print("Wrote", len(all_examples), "examples to", args.out)
 
 if __name__ == "__main__":
     main()
