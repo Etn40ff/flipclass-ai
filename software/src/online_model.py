@@ -24,7 +24,7 @@ def triangular_index(i: int, j: int) -> int:
     if i < 0 or j < 0:
         raise ValueError("exponents must be non-negative")
     d = i + j
-    # offset for degrees < d: sum_{k=0..d-1} (k+1) = d*(d+1)/2
+    # offset for degrees < d: sum_{k=0..d-1} (k+1) = d*(d+1)//2
     offset = d * (d + 1) // 2
     pos_within = d - i  # 0..d (i descends from d..0)
     return offset + pos_within
@@ -120,7 +120,7 @@ class SparseSGDRegressor:
             self.partial_fit_one(x, y)
             count += 1
             if verbose and count % 1000 == 0:
-                print(f"trained on {count} samples, weights={{len(self.weights)}}")
+                print(f"trained on {count} samples, weights={len(self.weights)}")
         return count
 
     def score_on_batch(self, X_sparse: Iterable[Dict[int, float]], y_iterable: Iterable[float]) -> Tuple[float, float]:
@@ -163,144 +163,3 @@ class SparseSGDRegressor:
         raw = joblib.load(path)
         d = raw.get("model") if isinstance(raw, dict) and "model" in raw else raw
         return cls.from_dict(d)
-
---- software/src/train_streaming.py ---
-#!/usr/bin/env python3
-"""
-Streaming / incremental trainer using sparse triangular-index representation.
-
-This trainer reads the raw polynomial examples pickle (polys.pkl) produced by
-extract_features_parallel.py (each example contains 'poly_coefs' mapping
-'i_j' -> coeff and 'target') and trains a SparseSGDRegressor that can grow
-to accommodate arbitrarily large monomials (no fixed max-degree).
-
-Example:
-  python software/src/train_streaming.py --from-polys dataset/polys.pkl --model models/sparse_model.joblib --eta0 1e-3 --l2 1e-5 --batch-size 2000
-
-Notes:
- - The model stores weights as a dict mapping triangular-index -> coefficient.
- - Optionally normalize each sample by its L2 norm (default True).
-"""
-import argparse
-import pickle
-import joblib
-from typing import Dict
-from software.src.online_model import coef_map_to_indexed_sparse, SparseSGDRegressor
-import math
-
-def stream_train(polys_pickle: str, model_path: str, batch_size: int = 2000, eta0: float = 1e-3, l2: float = 1e-5, normalize: bool = True):
-    with open(polys_pickle, "rb") as f:
-        examples = pickle.load(f)
-    if not isinstance(examples, list):
-        raise SystemExit("expected list of examples in polys pickle")
-
-    model = SparseSGDRegressor(eta0=eta0, l2=l2, normalize=normalize)
-
-    N = len(examples)
-    start = 0
-    while start < N:
-        end = min(N, start + batch_size)
-        batch = examples[start:end]
-        X_sparse = []
-        y = []
-        for ex in batch:
-            coefs = ex.get("poly_coefs", {}) or {}
-            xsp = coef_map_to_indexed_sparse(coefs)
-            X_sparse.append(xsp)
-            y.append(float(ex.get("target", 0)))
-        model.partial_fit_batch(X_sparse, y, verbose=False)
-        mse, cnt = model.score_on_batch(X_sparse, y)
-        print(f"Trained on {start}:{end} (batch {cnt}). batch_mse={{mse:.6g}}, total_weights={{len(model.weights)}}")
-        start = end
-
-    # Save model
-    meta = {
-        "model": model.to_dict(),
-        "format_version": 1,
-    }
-    joblib.dump(meta, model_path)
-    print("Saved sparse model to", model_path)
-    print("Final weights count:", len(model.weights))
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--from-polys", dest="polys", required=True, help="pickle produced by extract_features_parallel.py")
-    p.add_argument("--model", required=True, help="output joblib model path")
-    p.add_argument("--batch-size", type=int, default=2000)
-    p.add_argument("--eta0", type=float, default=1e-3)
-    p.add_argument("--l2", type=float, default=1e-5)
-    p.add_argument("--no-normalize", dest="normalize", action="store_false", help="disable per-sample L2 normalization")
-    args = p.parse_args()
-
-    stream_train(args.polys, args.model, batch_size=args.batch_size, eta0=args.eta0, l2=args.l2, normalize=args.normalize)
-
-if __name__ == "__main__":
-    main()
-
---- software/src/predict.py ---
-#!/usr/bin/env python3
-"""
-Predict with a sparse triangular-index model on arbitrary-degree polynomials.
-
-Usage:
-  # single polynomial (string parsed via build_dataset.poly_to_coefs)
-  python software/src/predict.py --model models/sparse_model.joblib --poly "3*x^2*y + 2*x*y^2 - 5"
-
-  # predict from a polys.pkl (each example has 'poly_coefs') and write CSV
-  python software/src/predict.py --model models/sparse_model.joblib --from-polys dataset/polys.pkl --out preds.csv
-"""
-import argparse
-import joblib
-import pickle
-import csv
-from software.src.build_dataset import poly_to_coefs
-from software.src.online_model import coef_map_to_indexed_sparse, SparseSGDRegressor
-
-def load_model(path: str) -> SparseSGDRegressor:
-    raw = joblib.load(path)
-    d = raw.get("model") if isinstance(raw, dict) and "model" in raw else raw
-    return SparseSGDRegressor.from_dict(d)
-
-def predict_one(model: SparseSGDRegressor, poly_str: str) -> float:
-    coefs = poly_to_coefs(poly_str)
-    xsp = coef_map_to_indexed_sparse(coefs)
-    return model.predict_sparse(xsp)
-
-def predict_from_polys(model: SparseSGDRegressor, polys_pickle: str, out_csv: str = None):
-    with open(polys_pickle, "rb") as f:
-        examples = pickle.load(f)
-    results = []
-    for ex in examples:
-        coefs = ex.get("poly_coefs", {}) or {}
-        xsp = coef_map_to_indexed_sparse(coefs)
-        pred = model.predict_sparse(xsp)
-        results.append({"source_file": ex.get("source_file"), "target": int(ex.get("target", 0)), "pred": float(pred)})
-    if out_csv:
-        with open(out_csv, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["source_file", "target", "pred"])
-            writer.writeheader()
-            for r in results:
-                writer.writerow(r)
-    return results
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--model", required=True)
-    p.add_argument("--poly", default=None)
-    p.add_argument("--from-polys", default=None)
-    p.add_argument("--out", default=None)
-    args = p.parse_args()
-
-    model = load_model(args.model)
-
-    if args.poly:
-        pred = predict_one(model, args.poly)
-        print("pred_raw:", pred, "pred_round:", int(round(pred)))
-    elif args.from_polys:
-        res = predict_from_polys(model, args.from_polys, out_csv=args.out)
-        print("Wrote predictions:", len(res), "to", args.out if args.out else "stdout")
-    else:
-        print("Specify --poly or --from-polys")
-
-if __name__ == "__main__":
-    main()
